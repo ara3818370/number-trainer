@@ -22,6 +22,11 @@ let noEnglishVoiceWarning = false;
 
 // ── Voice selection (TD-008) ───────────────────────────────────────────────
 
+/**
+ * Select the best English voice from a list.
+ * Priority: Samantha/Daniel → en-US → en-* → null (with warning).
+ * BUG-002: No longer silently falls back to non-English voice.
+ */
 function selectBestVoice(voices) {
   if (!voices || voices.length === 0) return null;
 
@@ -36,10 +41,19 @@ function selectBestVoice(voices) {
   const enAny = voices.find(v => v.lang.startsWith('en'));
   if (enAny) { noEnglishVoiceWarning = false; return enAny; }
 
+  // BUG-002: Do NOT silently fall back to a non-English voice.
+  // Set warning flag so init() can notify the UI.
   noEnglishVoiceWarning = true;
   return null;
 }
 
+// ── Initialization ─────────────────────────────────────────────────────────
+
+/**
+ * Initialize TTS: wait for voices, select best English voice.
+ * Must be called once at startup. Returns true if TTS is usable.
+ * @returns {Promise<boolean>}
+ */
 export function init() {
   return new Promise((resolve) => {
     if (!window.speechSynthesis) {
@@ -49,6 +63,7 @@ export function init() {
       return;
     }
 
+    // Try getting voices immediately
     let voices = speechSynthesis.getVoices();
     if (voices.length > 0) {
       selectedVoice = selectBestVoice(voices);
@@ -58,6 +73,7 @@ export function init() {
       return;
     }
 
+    // Wait for voiceschanged event (async on most browsers)
     let resolved = false;
 
     const onVoicesChanged = () => {
@@ -74,6 +90,7 @@ export function init() {
 
     speechSynthesis.addEventListener('voiceschanged', onVoicesChanged);
 
+    // Fallback: poll for voices if event doesn't fire (iOS quirk)
     let pollElapsed = 0;
     const pollTimer = setInterval(() => {
       pollElapsed += VOICE_POLL_INTERVAL_MS;
@@ -84,6 +101,7 @@ export function init() {
       }
       if (pollElapsed >= VOICE_POLL_MAX_MS && !resolved) {
         clearInterval(pollTimer);
+        // Last attempt
         voices = speechSynthesis.getVoices();
         selectedVoice = selectBestVoice(voices);
         available = !!selectedVoice;
@@ -93,6 +111,7 @@ export function init() {
       }
     }, VOICE_POLL_INTERVAL_MS);
 
+    // Hard timeout
     setTimeout(() => {
       if (!resolved) {
         clearInterval(pollTimer);
@@ -107,6 +126,14 @@ export function init() {
   });
 }
 
+// ── Speak ──────────────────────────────────────────────────────────────────
+
+/**
+ * Speak the given text using Web Speech API.
+ * @param {string} text - Text to speak (in English)
+ * @param {'slow'|'normal'|'fast'} speed - Speed preset name
+ * @returns {Promise<void>} Resolves when speech ends, rejects on error
+ */
 export function speak(text, speed = 'normal') {
   return new Promise((resolve, reject) => {
     if (!available || !selectedVoice) {
@@ -114,8 +141,10 @@ export function speak(text, speed = 'normal') {
       return;
     }
 
+    // Cancel any ongoing speech (TR-6 workaround)
     speechSynthesis.cancel();
 
+    // Small delay after cancel for iOS stability
     setTimeout(() => {
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.voice = selectedVoice;
@@ -126,9 +155,11 @@ export function speak(text, speed = 'normal') {
       utterance.onend = () => resolve();
 
       utterance.onerror = (event) => {
+        // Distinguish offline vs generic TTS error (ISSUE-005)
         if (!navigator.onLine) {
           reject(new Error('offline'));
         } else if (event.error === 'canceled') {
+          // Canceled is not a real error (user triggered cancel)
           resolve();
         } else {
           reject(new Error('tts_error'));
@@ -140,6 +171,12 @@ export function speak(text, speed = 'normal') {
   });
 }
 
+// ── Warm-up (UX-002) ───────────────────────────────────────────────────────
+
+/**
+ * Silent warm-up for iOS: triggers speech in a user gesture handler
+ * without producing audible sound. Uses volume=0 with a single space.
+ */
 export function warmUp() {
   if (!window.speechSynthesis) return;
   const utterance = new SpeechSynthesisUtterance(' ');
@@ -151,28 +188,51 @@ export function warmUp() {
   speechSynthesis.speak(utterance);
 }
 
+// ── Stop ───────────────────────────────────────────────────────────────────
+
+/**
+ * Stop any ongoing speech.
+ */
 export function stop() {
   if (window.speechSynthesis) {
     speechSynthesis.cancel();
   }
 }
 
+// ── Status ─────────────────────────────────────────────────────────────────
+
+/**
+ * Check if TTS is available and initialized.
+ */
 export function isAvailable() {
   return available;
 }
 
+/**
+ * Get the name of the selected voice (for diagnostics).
+ */
 export function getVoiceName() {
   return selectedVoice ? `${selectedVoice.name} (${selectedVoice.lang})` : 'none';
 }
 
+/**
+ * Check if no English voice was found (BUG-002).
+ * When true, the UI should warn the user.
+ */
 export function hasNoEnglishVoice() {
   return noEnglishVoiceWarning;
 }
 
+// ── Visibility change handler (EC-3) ───────────────────────────────────────
+
+/**
+ * Set a callback for when TTS may have been interrupted by tab switch.
+ */
 export function onInterrupt(callback) {
   onInterruptCallback = callback;
 }
 
+// Handle visibility changes — cancel TTS when tab goes hidden
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
@@ -183,6 +243,7 @@ if (typeof document !== 'undefined') {
   });
 }
 
+// Cancel TTS on page unload (EC-2)
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => stop());
 }
